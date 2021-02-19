@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"go/ast"
 	"go/format"
+	"go/printer"
+	"go/token"
 	"go/types"
 	"io/ioutil"
 	"log"
@@ -103,6 +105,7 @@ type Generator struct {
 // File holds a single parsed file and associated data.
 type File struct {
 	pkg  *Package  // Package to which this file belongs.
+	fileset *token.FileSet // Parsed Fileset to which this file belongs.
 	file *ast.File // Parsed AST.
 	// These fields are reset for each type being generated.
 	typeName string  // Name of the constant type.
@@ -125,6 +128,7 @@ type ValueType int
 
 const (
 	baseType ValueType = iota
+	pointerType
 	sliceType
 	mapType
 )
@@ -161,6 +165,7 @@ func (g *Generator) addPackage(pkg *packages.Package) {
 		g.pkg.files[i] = &File{
 			file: file,
 			pkg:  g.pkg,
+			fileset: pkg.Fset,
 		}
 	}
 }
@@ -171,10 +176,18 @@ var templateHeader string
 //go:embed baseType.inc
 var templateBaseType string
 
+//go:embed pointerType.inc
+var templatePointerType string
+
+//go:embed sliceType.inc
+var templateSliceType string
+
 func (g *Generator) generate(typeName string) {
 	tempHeader := template.Must(template.New("header").Parse(templateHeader))
 	temps := map[ValueType]*template.Template{
 		baseType: template.Must(template.New("baseType").Parse(templateBaseType)),
+		pointerType: template.Must(template.New("pointerType").Parse(templatePointerType)),
+		sliceType: template.Must(template.New("pointerType").Parse(templateSliceType)),
 	}
 
 	values := make([]Value, 0, 100)
@@ -195,8 +208,9 @@ func (g *Generator) generate(typeName string) {
 	})
 
 	for _, value := range values {
-
-		temps[value.valueType].Execute(&g.buf, map[string]string{
+		temp, ok := temps[value.valueType]
+		if !ok { continue}
+		temp.Execute(&g.buf, map[string]string{
 			"origName":  value.originalName,
 			"nameLower": lowerName(value.originalName),
 			"nameUpper": upperName(value.originalName),
@@ -236,7 +250,7 @@ func (f *File) structType(node ast.Node) bool {
 
 	f.values = []Value{}
 	for _, field := range st.Fields.List {
-		val, err := fromField(field)
+		val, err := f.fromField(field)
 		if err != nil {
 			log.Printf("Warning: %s", err)
 		}
@@ -248,7 +262,7 @@ func (f *File) structType(node ast.Node) bool {
 	return true
 }
 
-func fromField(field *ast.Field) (Value, error) {
+func (f *File) fromField(field *ast.Field) (Value, error) {
 	if len(field.Names) != 1 {
 		return Value{}, fmt.Errorf("No support for embedded types currently")
 	}
@@ -263,19 +277,43 @@ func fromField(field *ast.Field) (Value, error) {
 			valueType:    baseType,
 		}, nil
 	case *ast.ArrayType:
-		//TODO: split Arrays (which are base types) with slices
-		errStr = fmt.Sprintf("%T", ft)
+		buf := &bytes.Buffer{}
+		printer.Fprint(buf, f.fileset, ft)
+		valueType := sliceType
+		if ft.Len != nil { //This is an array use the basic type
+			valueType = baseType
+		}
+		return Value{
+			originalName: field.Names[0].Name,
+			originalType: buf.String(),
+			valueType:    valueType,
+		}, nil
 	case *ast.MapType:
-		//TODO: rebuild origional type eg `map[string]string`
-		errStr = fmt.Sprintf("%T", ft)
+		buf := &bytes.Buffer{}
+		printer.Fprint(buf, f.fileset, ft)
+		return Value{
+			originalName: field.Names[0].Name,
+			originalType: buf.String(),
+			valueType:    mapType,
+		}, nil
 	case *ast.FuncType:
-		//TODO: rebuild func signature
-		errStr = fmt.Sprintf("%T", ft)
+		buf := &bytes.Buffer{}
+		printer.Fprint(buf, f.fileset, ft)
+		return Value{
+			originalName: field.Names[0].Name,
+			originalType: buf.String(),
+			valueType:    baseType,
+		}, nil
 	case *ast.StarExpr:
-		//TODO: rebuild pointer type
-		errStr = fmt.Sprintf("%T", ft)
+		buf := &bytes.Buffer{}
+		printer.Fprint(buf, f.fileset, ft.X)
+		return Value{
+			originalName: field.Names[0].Name,
+			originalType: buf.String(),
+			valueType: pointerType,
+		}, nil
 	case *ast.SelectorExpr:
-		//TODO: rebuild interface type
+		//TODO: rebuild interface Interfaces need to be imported need to track those
 		errStr = fmt.Sprintf("%T", ft)
 	default:
 		errStr = fmt.Sprintf("Unknown type %T", ft)
