@@ -1,6 +1,13 @@
 package example
 
-import "io"
+import (
+	"bytes"
+	"io"
+
+	s "sync"
+
+	"github.com/pkg/errors"
+)
 
 type config struct {
 	myType MyType
@@ -13,6 +20,9 @@ type config struct {
 	point  *string
 	inter  io.Reader
 	MyType
+	buf   bytes.Buffer
+	buf2  *s.WaitGroup
+	frame errors.Frame
 }
 
 type MyType string

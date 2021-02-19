@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/format"
-	"go/printer"
-	"go/token"
 	"go/types"
 	"io/ioutil"
 	"log"
@@ -102,19 +100,11 @@ type Generator struct {
 	pkg *Package
 }
 
-// File holds a single parsed file and associated data.
-type File struct {
-	pkg  *Package  // Package to which this file belongs.
-	fileset *token.FileSet // Parsed Fileset to which this file belongs.
-	file *ast.File // Parsed AST.
-	// These fields are reset for each type being generated.
-	typeName string  // Name of the constant type.
-	values   []Value // Accumulator for constant values of that type.
-}
 type Package struct {
-	name  string
-	defs  map[*ast.Ident]types.Object
-	files []*File
+	name    string
+	defs    map[*ast.Ident]types.Object
+	types   *types.Package
+	imports map[string]*packages.Package
 }
 
 // Value represents a declared constant.
@@ -156,17 +146,10 @@ func (g *Generator) parsePackage(patterns []string, tags []string) {
 // addPackage adds a type checked Package and its syntax files to the generator.
 func (g *Generator) addPackage(pkg *packages.Package) {
 	g.pkg = &Package{
-		name:  pkg.Name,
-		defs:  pkg.TypesInfo.Defs,
-		files: make([]*File, len(pkg.Syntax)),
-	}
-
-	for i, file := range pkg.Syntax {
-		g.pkg.files[i] = &File{
-			file: file,
-			pkg:  g.pkg,
-			fileset: pkg.Fset,
-		}
+		name:    pkg.Name,
+		defs:    pkg.TypesInfo.Defs,
+		types:   pkg.Types,
+		imports: pkg.Imports,
 	}
 }
 
@@ -185,19 +168,55 @@ var templateSliceType string
 func (g *Generator) generate(typeName string) {
 	tempHeader := template.Must(template.New("header").Parse(templateHeader))
 	temps := map[ValueType]*template.Template{
-		baseType: template.Must(template.New("baseType").Parse(templateBaseType)),
+		baseType:    template.Must(template.New("baseType").Parse(templateBaseType)),
 		pointerType: template.Must(template.New("pointerType").Parse(templatePointerType)),
-		sliceType: template.Must(template.New("pointerType").Parse(templateSliceType)),
+		sliceType:   template.Must(template.New("pointerType").Parse(templateSliceType)),
 	}
 
 	values := make([]Value, 0, 100)
-	for _, file := range g.pkg.files {
-		// Set the state for this run of the walker.
-		file.typeName = typeName
-		file.values = nil
-		if file.file != nil {
-			ast.Inspect(file.file, file.structType)
-			values = append(values, file.values...)
+	//imports := make(map[string]struct{}, 0 , 100)
+
+	for e, v := range g.pkg.defs {
+		if e.Name == typeName {
+			struc := v.Type().(*types.Named).Underlying().(*types.Struct)
+			for i := 0; i < struc.NumFields(); i++ {
+				field := struc.Field(i)
+				if field.Embedded() {
+					continue
+				}
+				typeString := types.TypeString(field.Type(), types.RelativeTo(field.Pkg()))
+
+				var valueType ValueType
+				switch typ := field.Type().Underlying().(type) {
+				case *types.Basic:
+					valueType = baseType
+				case *types.Array:
+					valueType = baseType
+				case *types.Slice:
+					valueType = sliceType
+				case *types.Map:
+					valueType = mapType
+				case *types.Signature:
+					valueType = baseType
+				case *types.Pointer:
+					typeString = typeString[1:]
+					valueType = pointerType
+				case *types.Interface:
+					valueType = baseType
+				case *types.Struct:
+					valueType = baseType
+				default:
+					fmt.Printf("%s - %s - %T %#v\n", field.Name(), typeString, typ, typ)
+					continue
+				}
+
+				values = append(values, Value{
+					originalName: field.Name(),
+					originalType: typeString,
+					valueType:    valueType,
+				})
+			}
+
 		}
 
 	}
@@ -209,7 +228,9 @@ func (g *Generator) generate(typeName string) {
 
 	for _, value := range values {
 		temp, ok := temps[value.valueType]
-		if !ok { continue}
+		if !ok {
+			continue
+		}
 		temp.Execute(&g.buf, map[string]string{
 			"origName":  value.originalName,
 			"nameLower": lowerName(value.originalName),
@@ -228,99 +249,6 @@ func upperName(name string) string {
 	a := []rune(name)
 	a[0] = unicode.ToUpper(a[0])
 	return string(a)
-}
-
-func (f *File) structType(node ast.Node) bool {
-	if node == nil {
-		return true
-	}
-
-	ident, ok := node.(*ast.Ident)
-	if !ok || ident.Name != f.typeName {
-		return true
-	}
-	if ident.Obj == nil {
-		return true
-	}
-	ts, ok := ident.Obj.Decl.(*ast.TypeSpec)
-	if !ok {
-		return true
-	}
-	st, ok := ts.Type.(*ast.StructType)
-
-	f.values = []Value{}
-	for _, field := range st.Fields.List {
-		val, err := f.fromField(field)
-		if err != nil {
-			log.Printf("Warning: %s", err)
-		}
-		if err == nil {
-			f.values = append(f.values, val)
-		}
-	}
-
-	return true
-}
-
-func (f *File) fromField(field *ast.Field) (Value, error) {
-	if len(field.Names) != 1 {
-		return Value{}, fmt.Errorf("No support for embedded types currently")
-	}
-
-	var errStr string
-
-	switch ft := field.Type.(type) {
-	case *ast.Ident:
-		return Value{
-			originalName: field.Names[0].Name,
-			originalType: ft.Name,
-			valueType:    baseType,
-		}, nil
-	case *ast.ArrayType:
-		buf := &bytes.Buffer{}
-		printer.Fprint(buf, f.fileset, ft)
-		valueType := sliceType
-		if ft.Len != nil { //This is an array use the basic type
-			valueType = baseType
-		}
-		return Value{
-			originalName: field.Names[0].Name,
-			originalType: buf.String(),
-			valueType:    valueType,
-		}, nil
-	case *ast.MapType:
-		buf := &bytes.Buffer{}
-		printer.Fprint(buf, f.fileset, ft)
-		return Value{
-			originalName: field.Names[0].Name,
-			originalType: buf.String(),
-			valueType:    mapType,
-		}, nil
-	case *ast.FuncType:
-		buf := &bytes.Buffer{}
-		printer.Fprint(buf, f.fileset, ft)
-		return Value{
-			originalName: field.Names[0].Name,
-			originalType: buf.String(),
-			valueType:    baseType,
-		}, nil
-	case *ast.StarExpr:
-		buf := &bytes.Buffer{}
-		printer.Fprint(buf, f.fileset, ft.X)
-		return Value{
-			originalName: field.Names[0].Name,
-			originalType: buf.String(),
-			valueType: pointerType,
-		}, nil
-	case *ast.SelectorExpr:
-		//TODO: rebuild interface Interfaces need to be imported need to track those
-		errStr = fmt.Sprintf("%T", ft)
-	default:
-		errStr = fmt.Sprintf("Unknown type %T", ft)
-
-	}
-
-	return Value{}, fmt.Errorf("%s not supported yet", errStr)
 }
 
 func (g *Generator) format() []byte {
