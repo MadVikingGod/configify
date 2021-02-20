@@ -121,6 +121,7 @@ const (
 	pointerType
 	sliceType
 	mapType
+	interfaceType
 )
 
 // parsePackage analyzes the single package constructed from the patterns and tags.
@@ -165,16 +166,20 @@ var templatePointerType string
 //go:embed sliceType.inc
 var templateSliceType string
 
+//go:embed interfaceType.inc
+var templateInterfaceType string
+
 func (g *Generator) generate(typeName string) {
 	tempHeader := template.Must(template.New("header").Parse(templateHeader))
 	temps := map[ValueType]*template.Template{
-		baseType:    template.Must(template.New("baseType").Parse(templateBaseType)),
-		pointerType: template.Must(template.New("pointerType").Parse(templatePointerType)),
-		sliceType:   template.Must(template.New("pointerType").Parse(templateSliceType)),
+		baseType:      template.Must(template.New("baseType").Parse(templateBaseType)),
+		pointerType:   template.Must(template.New("pointerType").Parse(templatePointerType)),
+		sliceType:     template.Must(template.New("sliceType").Parse(templateSliceType)),
+		interfaceType: template.Must(template.New("InterfaceType").Parse(templateInterfaceType)),
 	}
 
 	values := make([]Value, 0, 100)
-	//imports := make(map[string]struct{}, 0 , 100)
+	imports := map[string]struct{}{}
 
 	for e, v := range g.pkg.defs {
 		if e.Name == typeName {
@@ -185,6 +190,13 @@ func (g *Generator) generate(typeName string) {
 					continue
 				}
 				typeString := types.TypeString(field.Type(), types.RelativeTo(field.Pkg()))
+				var imp string
+				if indx := strings.LastIndex(typeString, "."); indx > 0 {
+					imp = typeString[0:indx]
+				}
+				if indx := strings.LastIndex(typeString, "/"); indx > 0 {
+					typeString = typeString[indx+1:]
+				}
 
 				var valueType ValueType
 				switch typ := field.Type().Underlying().(type) {
@@ -199,15 +211,22 @@ func (g *Generator) generate(typeName string) {
 				case *types.Signature:
 					valueType = baseType
 				case *types.Pointer:
+					if len(imp) > 0 {
+						imp = imp[1:]
+					}
 					typeString = typeString[1:]
 					valueType = pointerType
 				case *types.Interface:
-					valueType = baseType
+					valueType = interfaceType
 				case *types.Struct:
 					valueType = baseType
 				default:
 					fmt.Printf("%s - %s - %T %#v\n", field.Name(), typeString, typ, typ)
 					continue
+				}
+
+				if len(imp) > 0 {
+					imports[imp] = struct{}{}
 				}
 
 				values = append(values, Value{
@@ -221,9 +240,15 @@ func (g *Generator) generate(typeName string) {
 
 	}
 
-	tempHeader.Execute(&g.buf, map[string]string{
+	importList := make([]string, 0, len(imports))
+	for imp := range imports {
+		importList = append(importList, imp)
+	}
+
+	tempHeader.Execute(&g.buf, map[string]interface{}{
 		"package": g.pkg.name,
 		"cfgType": typeName,
+		"imports": importList,
 	})
 
 	for _, value := range values {
